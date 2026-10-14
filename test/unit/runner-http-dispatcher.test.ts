@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { execFile, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -127,6 +130,41 @@ describe("runner dispatcher honours the resolved idle timeout", () => {
 			assert.notEqual(getGlobalDispatcher(), installed, "a fresh dispatcher replaces the bounded one");
 			const response = await globalThis.fetch(url);
 			assert.equal(await response.text(), "ok");
+		});
+	});
+
+	it("installs the real undici dependency under Bun and honours header timeouts", {
+		skip: spawnSync("bun", ["--version"]).error ? "Bun is not installed" : false,
+		timeout: 20_000,
+	}, async () => {
+		const bounded = fixture({ project: { httpIdleTimeoutMs: 200 } });
+		const unbounded = fixture({ project: { httpIdleTimeoutMs: 0 } });
+		const moduleUrl = new URL("../../src/runs/background/runner-http-dispatcher.ts", import.meta.url).href;
+		await withDelayedServer(2_500, async (url) => {
+			const script = `
+				import assert from "node:assert/strict";
+				import { createRequire } from "node:module";
+				import { installRunnerHttpDispatcher } from ${JSON.stringify(moduleUrl)};
+				const require = createRequire(${JSON.stringify(moduleUrl)});
+				const undici = require(require.resolve("undici/package.json").replace(/package.json$/, "index.js"));
+				const originalFetch = globalThis.fetch;
+				installRunnerHttpDispatcher(${JSON.stringify(bounded)});
+				assert.notEqual(globalThis.fetch, originalFetch, "real undici must replace Bun's native fetch");
+				const first = undici.getGlobalDispatcher();
+				try {
+					await assert.rejects(globalThis.fetch(${JSON.stringify(url)}), error => error.cause?.code === "UND_ERR_HEADERS_TIMEOUT");
+				} finally { await first.close(); }
+				installRunnerHttpDispatcher(${JSON.stringify(unbounded)});
+				try {
+					assert.equal(await (await globalThis.fetch(${JSON.stringify(url)})).text(), "ok");
+				} finally { await undici.getGlobalDispatcher().close(); }
+			`;
+			const result = await promisify(execFile)("bun", ["--eval", script], {
+				cwd: fileURLToPath(new URL("../../", import.meta.url)),
+				timeout: 15_000,
+				env: { ...process.env, HTTP_PROXY: "", HTTPS_PROXY: "", http_proxy: "", https_proxy: "", NO_PROXY: "*", no_proxy: "*" },
+			});
+			assert.doesNotMatch(result.stderr, /dispatcher not installed/);
 		});
 	});
 

@@ -228,6 +228,56 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	};
 }
 
+function workflowChildrenFromSteps(status: AsyncStatus, steps: AsyncStatus["steps"], state: "failed"): AsyncStatus["workflowChildren"] {
+	if (!status.workflowChildren) return undefined;
+	return {
+		...status.workflowChildren,
+		workflowState: state,
+		children: status.workflowChildren.children.map((child) => {
+			const step = steps?.find((candidate) => child.runId ? candidate.runId === child.runId : candidate.workflowKey === child.childId);
+			if (!step) return child;
+			const childState = step.status === "complete" || step.status === "completed" ? "completed" : step.status === "partial" ? "failed" : step.status;
+			return { ...child, state: childState, ...(childState !== "running" ? { activity: undefined } : {}) };
+		}),
+	};
+}
+
+/** A dead host is not evidence that its independently owned async children failed. */
+function recoverCompletedWorkflowChildren(status: AsyncStatus, asyncDir: string): AsyncStatus {
+	if (status.mode !== "workflow" || !status.steps) return status;
+	const parentRunId = status.runId ?? path.basename(asyncDir);
+	let changed = false;
+	const steps = status.steps.map((step) => {
+		if (step.status !== "running" && step.status !== "pending" && step.status !== "failed") return step;
+		if (step.async !== true || !step.runId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(step.runId)) return step;
+		let child: AsyncStatus | null;
+		try { child = readStatus(path.join(path.dirname(asyncDir), step.runId)); } catch { return step; }
+		if (!child || child.runId !== step.runId || child.parentWorkflowRunId !== parentRunId || child.sessionId !== status.sessionId || child.completionOwnerId !== status.completionOwnerId) return step;
+		if (step.workflowKey && child.workflowKey !== step.workflowKey) return step;
+		if (child.state !== "complete" || child.steps?.some((entry) => entry.status !== "complete" && entry.status !== "completed")) return step;
+		changed = true;
+		const endedAt = child.endedAt ?? step.endedAt;
+		return {
+			...step,
+			status: "complete" as const,
+			activityState: undefined,
+			endedAt,
+			durationMs: endedAt !== undefined && step.startedAt !== undefined ? Math.max(0, endedAt - step.startedAt) : step.durationMs,
+			exitCode: 0,
+			error: undefined,
+			stopped: undefined,
+			sessionFile: step.sessionFile ?? child.steps?.[0]?.sessionFile,
+			sessionName: step.sessionName ?? child.steps?.[0]?.sessionName,
+		};
+	});
+	if (!changed) return status;
+	return {
+		...status,
+		steps,
+		...(status.state === "failed" ? { workflowChildren: workflowChildrenFromSteps(status, steps, "failed") } : {}),
+	};
+}
+
 function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, reason?: string): { status: AsyncStatus; result: Record<string, unknown>; message: string } {
 	const runId = status.runId || path.basename(asyncDir);
 	const pid = typeof status.pid === "number" ? status.pid : "unknown";
@@ -241,7 +291,8 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 	const baseMessage = reason ?? `Async runner process ${pid} ${exitText} before writing a result. Marked run failed by stale-run reconciliation.`;
 	const diagnostics = readRunnerStartupDiagnostics(asyncDir);
 	const message = diagnostics ? `${baseMessage}\n\nRunner stderr tail:\n${diagnostics}` : baseMessage;
-	const steps = status.steps?.length ? status.steps : [{ agent: "subagent", status: "running" as const }];
+	const observed = recoverCompletedWorkflowChildren(status, asyncDir);
+	const steps = observed.steps?.length ? observed.steps : [{ agent: "subagent", status: "running" as const }];
 	const repairedSteps = steps.map((step) => step.status === "running" || step.status === "pending"
 		? {
 			...step,
@@ -263,6 +314,7 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 		lastUpdate: now,
 		endedAt: now,
 		steps: repairedSteps,
+		...(status.workflowChildren ? { workflowChildren: workflowChildrenFromSteps(status, repairedSteps, "failed") } : {}),
 	};
 	const resultAgent = repairedSteps[status.currentStep ?? 0]?.agent ?? repairedSteps[0]?.agent ?? "subagent";
 	return {
@@ -400,6 +452,17 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const existingResultPath = effectiveStatus.sessionId
 		? resultPayloadPathForSessionRun(resultsDir, effectiveStatus.sessionId, runId) ?? (regularFileExists(resultPath) ? resultPath : undefined)
 		: regularFileExists(resultPath) ? resultPath : undefined;
+	// Completion receipts are immutable host-failure snapshots. Refresh only the
+	// live status projection when an independently owned child finishes later.
+	if (effectiveStatus.state === "failed" && effectiveStatus.displayDismissedAt === undefined) {
+		const recovered = recoverCompletedWorkflowChildren(effectiveStatus, asyncDir);
+		if (recovered !== effectiveStatus) {
+			const refreshed = { ...recovered, lastUpdate: now };
+			writeAtomicJson(statusPath, refreshed);
+			appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), { type: "subagent.workflow.children_reconciled", ts: now, runId });
+			return { status: refreshed, repaired: true, ...(existingResultPath ? { resultPath: existingResultPath } : {}), message: "Completed workflow children were recovered from their own terminal status." };
+		}
+	}
 	if (existingResultPath) {
 		const terminalStatus = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
 			? terminalStatusFromResult(effectiveStatus, existingResultPath, now)
@@ -416,12 +479,13 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 					? { ...step, processTerminal: currentStepTerminal }
 					: step;
 			});
-			const statusToWrite: AsyncStatus = {
+			const repairedStatus: AsyncStatus = {
 				...terminalStatus,
 				...(currentRootError ? { error: currentRootError } : {}),
 				...(currentTerminal ? { processTerminal: currentTerminal } : {}),
 				...(steps ? { steps } : {}),
 			};
+			const statusToWrite = repairedStatus.state === "failed" ? recoverCompletedWorkflowChildren(repairedStatus, asyncDir) : repairedStatus;
 			writeAtomicJson(statusPath, statusToWrite);
 			updateActiveRunIndex(asyncDir, statusToWrite.state, statusToWrite.toolCallId);
 			return { status: statusToWrite, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };

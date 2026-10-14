@@ -107,8 +107,11 @@ export function runnerHttpDispatcherOptions(timeoutMs: number): {
  */
 export function installRunnerHttpDispatcher(options: { agentDir: string; cwd: string }): void {
 	try {
-		// SAFETY: require loads the pinned direct dependency described by these types.
-		const undici = createRequire(import.meta.url)("undici") as typeof import("undici");
+		// Bun shadows bare "undici" with an incomplete built-in compatibility module.
+		// Resolve the pinned package first so Node and Bun load the same real dependency.
+		const require = createRequire(import.meta.url);
+		const packageDir = path.dirname(require.resolve("undici/package.json"));
+		const undici = require(path.join(packageDir, "index.js")) as typeof import("undici");
 		const idle = resolveHttpIdleTimeoutMs(options);
 		if (idle.warning) console.error(`[pi-subagents] httpIdleTimeoutMs: ${idle.warning}; using ${idle.timeoutMs}ms`);
 		const dispatcher = new undici.EnvHttpProxyAgent(runnerHttpDispatcherOptions(idle.timeoutMs));

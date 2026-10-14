@@ -172,6 +172,113 @@ describe("async stale-run reconciliation", () => {
 		}
 	});
 
+	it("preserves independently completed workflow children when the host disappears", () => {
+		const root = tempRoot("pi-stale-workflow-children-");
+		try {
+			const runId = "workflow-dead";
+			const asyncDir = path.join(root, runId);
+			const resultsDir = path.join(root, "results");
+			const keys = ["done", "missing", "foreign", "malformed", "running", "other-session", "wrong-key", "wrong-id", "other-owner"];
+			writeStatus(asyncDir, {
+				runId, sessionId: "workflow-session", mode: "workflow", state: "running", pid: 12345,
+				startedAt: 1000, lastUpdate: 1000,
+				steps: keys.map((key) => ({ agent: "worker", workflowKey: key, async: true, runId: `child-${key}`, status: "running", startedAt: 1000 })),
+				workflowChildren: { version: 1, parentToolCallId: "tool-workflow", workflowRunId: runId, workflowState: "running", inventoryComplete: false,
+					children: keys.map((key) => ({ childId: key, runId: `child-${key}`, state: "running" })) },
+			});
+			for (const key of ["done", "foreign", "running", "other-session", "wrong-key", "wrong-id", "other-owner"]) {
+				writeStatus(path.join(root, `child-${key}`), {
+					runId: key === "wrong-id" ? "other-child" : `child-${key}`, parentWorkflowRunId: key === "foreign" ? "other-workflow" : runId,
+					workflowKey: key === "wrong-key" ? "other-key" : key, sessionId: key === "other-session" ? "other-session" : "workflow-session", completionOwnerId: key === "other-owner" ? "other-owner" : undefined, mode: "single", state: key === "running" ? "running" : "complete",
+					startedAt: 1000, endedAt: 1500, lastUpdate: 1500,
+					steps: [{ agent: "worker", status: key === "running" ? "running" : "complete", exitCode: 0, sessionFile: `${key}.jsonl` }],
+				});
+			}
+			fs.mkdirSync(path.join(root, "child-malformed"));
+			fs.writeFileSync(path.join(root, "child-malformed", "status.json"), "{broken");
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, kill: () => { throw errno("ESRCH"); }, now: () => 2000 });
+			assert.equal(result.status?.state, "failed", "host failure must not become workflow success");
+			assert.equal(result.status?.steps?.[0]?.status, "complete");
+			assert.equal(result.status?.steps?.[0]?.exitCode, 0);
+			assert.equal(result.status?.steps?.[0]?.sessionFile, "done.jsonl");
+			assert.equal(result.status?.workflowChildren?.workflowState, "failed");
+			assert.equal(result.status?.workflowChildren?.children[0]?.state, "completed");
+			for (const step of result.status?.steps?.slice(1) ?? []) assert.equal(step.status, "failed");
+			const receipt = JSON.parse(fs.readFileSync(path.join(resultsDir, `${runId}.json`), "utf8"));
+			assert.equal(receipt.success, false);
+			assert.equal(receipt.results[0].success, true);
+			assert.equal(receipt.results[1].success, false);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("refreshes late completed children of a failed workflow without rewriting its completion receipt", () => {
+		const root = tempRoot("pi-stale-workflow-late-");
+		try {
+			const runId = "workflow-late";
+			const asyncDir = path.join(root, runId);
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId, sessionId: "workflow-session", mode: "workflow", state: "failed", startedAt: 1000, lastUpdate: 1500, endedAt: 1500,
+				steps: [{ agent: "worker", workflowKey: "late", async: true, runId: "child-late", status: "failed", startedAt: 1000, endedAt: 1500, exitCode: 1, error: "host disappeared" }],
+				workflowChildren: { version: 1, parentToolCallId: "tool-workflow", workflowRunId: runId, workflowState: "failed", inventoryComplete: false,
+					children: [{ childId: "late", runId: "child-late", state: "failed" }] },
+			});
+			writeStatus(path.join(root, "child-late"), {
+				runId: "child-late", parentWorkflowRunId: runId, workflowKey: "late", sessionId: "workflow-session", mode: "single", state: "complete",
+				startedAt: 1000, lastUpdate: 2500, endedAt: 2500, steps: [{ agent: "worker", status: "complete", exitCode: 0, sessionFile: "late.jsonl" }],
+			});
+			fs.mkdirSync(resultsDir);
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			const receipt = JSON.stringify({ id: runId, sessionId: "workflow-session", success: false, state: "failed", summary: "host disappeared", results: [{ success: false }] });
+			fs.writeFileSync(resultPath, receipt);
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 3000 });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.endedAt, 1500, "the host's terminal timestamp is unchanged");
+			assert.equal(result.status?.steps?.[0]?.status, "complete");
+			assert.equal(result.status?.steps?.[0]?.endedAt, 2500);
+			assert.equal(result.status?.steps?.[0]?.durationMs, 1500);
+			assert.equal(result.status?.steps?.[0]?.error, undefined);
+			assert.equal(result.status?.workflowChildren?.children[0]?.state, "completed");
+			assert.equal(fs.readFileSync(resultPath, "utf8"), receipt, "completion delivery remains an immutable failure snapshot");
+			assert.equal(reconcileAsyncRun(asyncDir, { resultsDir, now: () => 4000 }).repaired, false, "refresh is idempotent");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("recovers completed children while repairing running workflow status from its failure receipt", () => {
+		const root = tempRoot("pi-stale-workflow-receipt-");
+		try {
+			const runId = "workflow-receipt";
+			const asyncDir = path.join(root, runId);
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, { runId, sessionId: "workflow-session", mode: "workflow", state: "running", pid: 12345, startedAt: 1000, lastUpdate: 1000,
+				steps: [{ agent: "worker", workflowKey: "done", async: true, runId: "child-done", status: "running", startedAt: 1000 }] });
+			writeStatus(path.join(root, "child-done"), { runId: "child-done", parentWorkflowRunId: runId, workflowKey: "done", sessionId: "workflow-session", mode: "single", state: "complete",
+				startedAt: 1000, lastUpdate: 1500, endedAt: 1500, steps: [{ agent: "worker", status: "complete", exitCode: 0 }] });
+			fs.mkdirSync(resultsDir);
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			const receipt = JSON.stringify({ id: runId, sessionId: "workflow-session", success: false, state: "failed", results: [{ success: false }] });
+			fs.writeFileSync(resultPath, receipt);
+			const result = reconcileAsyncRun(asyncDir, { resultsDir, now: () => 2000 });
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.equal(result.status?.steps?.[0]?.status, "complete");
+			assert.equal(fs.readFileSync(resultPath, "utf8"), receipt);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("does not read a workflow child outside its sibling run directory", () => {
+		const root = tempRoot("pi-stale-workflow-path-");
+		try {
+			const asyncDir = path.join(root, "workflow-path");
+			writeStatus(asyncDir, { runId: "workflow-path", mode: "workflow", state: "failed", startedAt: 1000, lastUpdate: 1000,
+				steps: [{ agent: "worker", workflowKey: "escape", async: true, runId: "../escape", status: "failed" }] });
+			const result = reconcileAsyncRun(asyncDir, { resultsDir: path.join(root, "results"), now: () => 2000 });
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.steps?.[0]?.status, "failed");
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
 	it("marks a dead runner failed and writes exactly one completion result", () => {
 		const root = tempRoot("pi-stale-run-");
 		try {
